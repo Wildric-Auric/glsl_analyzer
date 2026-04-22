@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const File = std.fs.File;
+const File = std.Io.File;
 
 const util = @import("util.zig");
 const lsp = @import("lsp.zig");
@@ -20,33 +20,21 @@ pub const std_options: std.Options = .{
 
 var stdout_buffer: [1024]u8 = undefined;
 
-fn enableDevelopmentMode(stderr_target: []const u8) !void {
-    if (builtin.os.tag == .linux) {
-        // redirect stderr to the build root
-        const new_stderr = try std.posix.open(
-            stderr_target,
-            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
-            0o644,
-        );
-        try std.posix.dup2(new_stderr, std.posix.STDERR_FILENO);
-        std.posix.close(new_stderr);
-    } else {
-        std.log.warn("development mode not available on {s}", .{@tagName(builtin.os.tag)});
-        return error.UnsupportedPlatform;
-    }
+fn enableDevelopmentMode(_: []const u8) !void {
+    std.log.warn("development mode not available on {s}", .{@tagName(builtin.os.tag)});
+    return error.UnsupportedPlatform;
 }
 
-pub fn main() !u8 {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .stack_trace_frames = 8 }){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !u8 {
+    const io = init.io;
+    const allocator = init.gpa;
     var static_arena = std.heap.ArenaAllocator.init(allocator);
     defer static_arena.deinit();
 
-    var alloc_args = try std.process.argsWithAllocator(allocator);
+    var alloc_args = try init.minimal.args.iterateAllocator(allocator);
     defer alloc_args.deinit();
 
-    const args = try cli.Arguments.parse(&alloc_args);
+    const args = try cli.Arguments.parse(io, &alloc_args);
 
     if (args.dev_mode) |stderr_target| {
         if (enableDevelopmentMode(stderr_target)) {
@@ -58,7 +46,7 @@ pub fn main() !u8 {
     }
 
     if (args.format_file) |path| {
-        const source = std.fs.cwd().readFileAlloc(allocator, path, 1 << 30) catch |err| {
+        const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 30)) catch |err| {
             std.log.err("could not open '{s}': {s}", .{ path, @errorName(err) });
             return err;
         };
@@ -79,7 +67,7 @@ pub fn main() !u8 {
         if (diagnostics.items.len != 0) {
             for (diagnostics.items) |diagnostic| {
                 const position = diagnostic.position(source);
-                var stderr_writer = std.fs.File.stderr().writer(&stdout_buffer);
+                var stderr_writer = std.Io.File.stderr().writer(io, &stdout_buffer);
                 const stderr = &stderr_writer.interface;
                 try stderr.print(
                     "{s}:{}:{}: {s}\n",
@@ -89,7 +77,7 @@ pub fn main() !u8 {
             return 1;
         }
 
-        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
         const stdout = &stdout_writer.interface;
 
         try @import("format.zig").format(tree, source, stdout, .{
@@ -101,7 +89,7 @@ pub fn main() !u8 {
     }
 
     if (args.parse_file) |path| {
-        const source = std.fs.cwd().readFileAlloc(allocator, path, 1 << 30) catch |err| {
+        const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 30)) catch |err| {
             std.log.err("could not open '{s}': {s}", .{ path, @errorName(err) });
             return err;
         };
@@ -114,7 +102,7 @@ pub fn main() !u8 {
         defer tree.deinit(allocator);
 
         if (args.print_ast) {
-            var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+            var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
             const stdout = &stdout_writer.interface;
 
             try stdout.print("{f}", .{tree.format(source)});
@@ -124,7 +112,7 @@ pub fn main() !u8 {
         if (diagnostics.items.len != 0) {
             for (diagnostics.items) |diagnostic| {
                 const position = diagnostic.position(source);
-                var stderr_writer = std.fs.File.stderr().writer(&stdout_buffer);
+                var stderr_writer = std.Io.File.stderr().writer(io, &stdout_buffer);
                 const stderr = &stderr_writer.interface;
                 try stderr.print(
                     "{s}:{}:{}: {s}\n",
@@ -140,28 +128,28 @@ pub fn main() !u8 {
 
     var channel: Channel = switch (args.channel) {
         .stdio => .{ .stdio = .{
-            .stdout = std.fs.File.stdout(),
-            .stdin = std.fs.File.stdin(),
+            .stdout = std.Io.File.stdout(),
+            .stdin = std.Io.File.stdin(),
         } },
         .socket => |port| blk: {
             if (builtin.os.tag == .wasi) {
                 return error.UnsupportedPlatform;
             }
 
-            const address = try std.net.Address.parseIp("127.0.0.1", port);
+            const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
 
-            var server = try address.listen(.{});
-            defer server.deinit();
+            var server = try address.listen(io, .{});
+            defer server.deinit(io);
 
-            const connection = try server.accept();
-            std.log.info("incoming connection from {f}", .{connection.address});
-            break :blk .{ .socket = connection.stream };
+            const connection = try server.accept(io);
+            std.log.info("incoming connection from {f}", .{connection.socket.address});
+            break :blk .{ .socket = connection };
         },
     };
-    defer channel.close();
+    defer channel.close(io);
 
     var channel_buffer: [1024]u8 = undefined;
-    var channel_writer = channel.writer(&channel_buffer);
+    var channel_writer = channel.writer(io, &channel_buffer);
     var state = State{
         .allocator = allocator,
         .channel = channel_writer.interface(),
@@ -170,7 +158,7 @@ pub fn main() !u8 {
     defer state.deinit();
 
     var reader_buffer: [1024]u8 = undefined;
-    var reader = channel.reader(&reader_buffer);
+    var reader = channel.reader(io, &reader_buffer);
 
     var header_buffer: [1024]u8 = undefined;
     var header_stream = std.Io.Writer.fixed(&header_buffer);
@@ -230,7 +218,7 @@ pub fn main() !u8 {
             };
         };
 
-        state.handleMessage(&message) catch |err| switch (err) {
+        state.handleMessage(io, &message) catch |err| switch (err) {
             error.Failure => continue,
             else => return err,
         };
@@ -259,7 +247,7 @@ fn parseHeaders(bytes: []const u8) !HeaderValues {
 
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line| {
-        const trimmed = std.mem.trimRight(u8, line, &std.ascii.whitespace);
+        const trimmed = std.mem.trimEnd(u8, line, &std.ascii.whitespace);
         if (trimmed.len == 0) continue;
 
         const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse return error.InvalidHeader;
@@ -282,65 +270,65 @@ fn parseHeaders(bytes: []const u8) !HeaderValues {
 
 pub const Channel = union(enum) {
     stdio: struct {
-        stdin: std.fs.File,
-        stdout: std.fs.File,
+        stdin: std.Io.File,
+        stdout: std.Io.File,
     },
-    socket: std.net.Stream,
+    socket: std.Io.net.Stream,
 
-    pub fn close(self: *Channel) void {
+    pub fn close(self: *Channel, io: std.Io) void {
         switch (self.*) {
             .stdio => {},
-            .socket => |stream| stream.close(),
+            .socket => |stream| stream.close(io),
         }
     }
 
-    pub const ReadError = std.fs.File.ReadError || std.net.Stream.ReadError || std.io.Reader.Error;
+    pub const ReadError = std.Io.File.ReadError || std.Io.net.Stream.ReadError || std.io.Reader.Error;
     pub const Reader = struct {
         channel: *Channel,
 
-        stdin_reader: std.fs.File.Reader = undefined,
-        socket_reader: std.net.Stream.Reader = undefined,
+        stdin_reader: std.Io.File.Reader = undefined,
+        socket_reader: std.Io.net.Stream.Reader = undefined,
 
-        pub fn init(channel: *Channel, buffer: []u8) Reader {
+        pub fn init(channel: *Channel, io: std.Io, buffer: []u8) Reader {
             var r: Reader = .{
                 .channel = channel,
             };
 
             switch (r.channel.*) {
-                .stdio => |stdio| r.stdin_reader = stdio.stdin.reader(buffer),
-                .socket => |stream| r.socket_reader = stream.reader(buffer),
+                .stdio => |stdio| r.stdin_reader = stdio.stdin.reader(io, buffer),
+                .socket => |stream| r.socket_reader = stream.reader(io, buffer),
             }
 
             return r;
         }
 
-        pub fn interface(r: *Reader) *std.io.Reader {
+        pub fn interface(r: *Reader) *std.Io.Reader {
             return switch (r.channel.*) {
                 .stdio => &r.stdin_reader.interface,
-                .socket => r.socket_reader.interface(),
+                .socket => &r.socket_reader.interface,
             };
         }
     };
 
-    pub fn reader(self: *Channel, buffer: []u8) Reader {
-        return .init(self, buffer);
+    pub fn reader(self: *Channel, io: std.Io, buffer: []u8) Reader {
+        return .init(self, io, buffer);
     }
 
-    pub const WriteError = std.fs.File.WriteError || std.net.Stream.WriteError || std.io.Writer.Error;
+    pub const WriteError = std.Io.File.Writer.Error || std.Io.net.Stream.Writer.Error || std.json.Stringify.Error;
     pub const Writer = struct {
         channel: *Channel,
 
-        stdout_writer: std.fs.File.Writer = undefined,
-        socket_writer: std.net.Stream.Writer = undefined,
+        stdout_writer: std.Io.File.Writer = undefined,
+        socket_writer: std.Io.net.Stream.Writer = undefined,
 
-        pub fn init(channel: *Channel, buffer: []u8) Writer {
+        pub fn init(channel: *Channel, io: std.Io, buffer: []u8) Writer {
             var w: Writer = .{
                 .channel = channel,
             };
 
             switch (w.channel.*) {
-                .stdio => |stdio| w.stdout_writer = stdio.stdout.writer(buffer),
-                .socket => |stream| w.socket_writer = stream.writer(buffer),
+                .stdio => |stdio| w.stdout_writer = stdio.stdout.writer(io, buffer),
+                .socket => |stream| w.socket_writer = stream.writer(io, buffer),
             }
 
             return w;
@@ -354,15 +342,15 @@ pub const Channel = union(enum) {
         }
     };
 
-    pub fn writer(self: *Channel, buffer: []u8) Writer {
-        return .init(self, buffer);
+    pub fn writer(self: *Channel, io: std.Io, buffer: []u8) Writer {
+        return .init(self, io, buffer);
     }
 };
 
 const State = struct {
     allocator: std.mem.Allocator,
 
-    channel: *std.io.Writer,
+    channel: *std.Io.Writer,
     running: bool = true,
     initialized: bool = false,
     parent_pid: ?c_int = null,
@@ -372,18 +360,18 @@ const State = struct {
         self.workspace.deinit();
     }
 
-    fn handleMessage(self: *State, message: *rpc.Message(Request)) !void {
+    fn handleMessage(self: *State, io: std.Io, message: *rpc.Message(Request)) !void {
         switch (message.*) {
-            .single => |*request| try self.dispatchRequest(request),
-            .batch => |batch| try self.dispatchBatch(batch),
+            .single => |*request| try self.dispatchRequest(io, request),
+            .batch => |batch| try self.dispatchBatch(io, batch),
         }
     }
 
-    fn dispatchBatch(self: *State, requests: []Request) !void {
-        for (requests) |*request| try self.dispatchRequest(request);
+    fn dispatchBatch(self: *State, io: std.Io, requests: []Request) !void {
+        for (requests) |*request| try self.dispatchRequest(io, request);
     }
 
-    fn dispatchRequest(self: *State, request: *Request) !void {
+    fn dispatchRequest(self: *State, io: std.Io, request: *Request) !void {
         if (!std.mem.eql(u8, request.jsonrpc, "2.0"))
             return self.fail(request.id, .{
                 .code = .invalid_request,
@@ -400,7 +388,7 @@ const State = struct {
 
         inline for (Dispatch.methods) |method| {
             if (std.mem.eql(u8, request.method, method)) {
-                try @field(Dispatch, method)(self, request);
+                try @field(Dispatch, method)(self, io, request);
                 return;
             }
         }
@@ -505,7 +493,7 @@ pub const Dispatch = struct {
         capabilities: lsp.ClientCapabilities,
     };
 
-    pub fn initialize(state: *State, request: *Request) !void {
+    pub fn initialize(state: *State, _: std.Io, request: *Request) !void {
         if (state.initialized) {
             return state.fail(request.id, .{
                 .code = .invalid_request,
@@ -539,12 +527,12 @@ pub const Dispatch = struct {
         state.parent_pid = state.parent_pid orelse params.value.processId;
     }
 
-    pub fn shutdown(state: *State, request: *Request) !void {
+    pub fn shutdown(state: *State, _: std.Io, request: *Request) !void {
         state.running = false;
         try state.success(request.id, null);
     }
 
-    pub fn initialized(state: *State, request: *Request) !void {
+    pub fn initialized(state: *State, _: std.Io, request: *Request) !void {
         _ = request;
         _ = state;
         return;
@@ -554,7 +542,7 @@ pub const Dispatch = struct {
         textDocument: lsp.TextDocumentItem,
     };
 
-    pub fn @"textDocument/didOpen"(state: *State, request: *Request) !void {
+    pub fn @"textDocument/didOpen"(state: *State, _: std.Io, request: *Request) !void {
         const params = try parseParams(DidOpenParams, state, request);
         defer params.deinit();
 
@@ -576,7 +564,7 @@ pub const Dispatch = struct {
         textDocument: lsp.TextDocumentIdentifier,
     };
 
-    pub fn @"textDocument/didClose"(state: *State, request: *Request) !void {
+    pub fn @"textDocument/didClose"(state: *State, _: std.Io, request: *Request) !void {
         const params = try parseParams(DidCloseParams, state, request);
         defer params.deinit();
         std.log.debug("closed: {s}", .{params.value.textDocument.uri});
@@ -588,7 +576,7 @@ pub const Dispatch = struct {
         text: ?[]const u8 = null,
     };
 
-    pub fn @"textDocument/didSave"(state: *State, request: *Request) !void {
+    pub fn @"textDocument/didSave"(state: *State, _: std.Io, request: *Request) !void {
         const params = try parseParams(DidSaveParams, state, request);
         defer params.deinit();
 
@@ -605,7 +593,7 @@ pub const Dispatch = struct {
         contentChanges: []const lsp.TextDocumentContentChangeEvent,
     };
 
-    pub fn @"textDocument/didChange"(state: *State, request: *Request) !void {
+    pub fn @"textDocument/didChange"(state: *State, _: std.Io, request: *Request) !void {
         const params = try parseParams(DidChangeParams, state, request);
         defer params.deinit();
 
@@ -628,7 +616,7 @@ pub const Dispatch = struct {
         position: lsp.Position,
     };
 
-    pub fn @"textDocument/completion"(state: *State, request: *Request) !void {
+    pub fn @"textDocument/completion"(state: *State, io: std.Io, request: *Request) !void {
         const params = try parseParams(CompletionParams, state, request);
         defer params.deinit();
 
@@ -652,6 +640,7 @@ pub const Dispatch = struct {
 
         try completionsAtToken(
             state,
+            io,
             document,
             token,
             &completions,
@@ -664,6 +653,7 @@ pub const Dispatch = struct {
 
     fn completionsAtToken(
         state: *State,
+        io: std.Io,
         document: *Workspace.Document,
         start_token: ?u32,
         completions: *std.array_list.Managed(lsp.CompletionItem),
@@ -675,10 +665,10 @@ pub const Dispatch = struct {
         var symbols = std.array_list.Managed(analysis.Reference).init(arena);
 
         if (start_token) |token| {
-            try analysis.visibleFields(arena, document, token, &symbols);
+            try analysis.visibleFields(io, arena, document, token, &symbols);
             has_fields = symbols.items.len != 0;
 
-            if (!has_fields) try analysis.visibleSymbols(arena, document, token, &symbols);
+            if (!has_fields) try analysis.visibleSymbols(io, arena, document, token, &symbols);
 
             try completions.ensureUnusedCapacity(symbols.items.len);
 
@@ -733,7 +723,7 @@ pub const Dispatch = struct {
         position: lsp.Position,
     };
 
-    pub fn @"textDocument/hover"(state: *State, request: *Request) !void {
+    pub fn @"textDocument/hover"(state: *State, io: std.Io, request: *Request) !void {
         const params = try parseParams(HoverParams, state, request);
         defer params.deinit();
 
@@ -761,6 +751,7 @@ pub const Dispatch = struct {
 
         try completionsAtToken(
             state,
+            io,
             document,
             token,
             &completions,
@@ -769,52 +760,51 @@ pub const Dispatch = struct {
         );
 
         // group completions by their documentation.
-        var groups = std.StringArrayHashMap(std.ArrayListUnmanaged(*const lsp.CompletionItem))
-            .init(symbol_arena.allocator());
-        defer groups.deinit();
+        var groups: std.array_hash_map.String(std.ArrayListUnmanaged(*const lsp.CompletionItem)) = .empty;
+        defer groups.deinit(symbol_arena.allocator());
 
         for (completions.items) |*completion| {
             if (!std.mem.eql(u8, completion.label, token_text)) continue;
 
             const documentation_string = if (completion.documentation) |markup| markup.value else "";
 
-            const result = try groups.getOrPut(documentation_string);
-            if (!result.found_existing) result.value_ptr.* = .{};
+            const result = try groups.getOrPut(symbol_arena.allocator(), documentation_string);
+            if (!result.found_existing) result.value_ptr.* = .empty;
             try result.value_ptr.append(symbol_arena.allocator(), completion);
         }
 
-        var text = std.array_list.Managed(u8).init(symbol_arena.allocator());
+        var text: std.Io.Writer.Allocating = .init(symbol_arena.allocator());
         defer text.deinit();
 
         for (groups.keys(), groups.values()) |description, group| {
-            if (text.items.len != 0) {
-                try text.appendSlice("\n\n---\n\n");
+            if (text.written().len != 0) {
+                try text.writer.writeAll("\n\n---\n\n");
             }
 
             if (group.items.len != 0) {
-                try text.appendSlice("```glsl\n");
+                try text.writer.writeAll("```glsl\n");
                 for (group.items) |completion| {
                     if (completion.detail) |detail| {
-                        try text.writer().print("{s}\n", .{detail});
+                        try text.writer.print("{s}\n", .{detail});
                     }
                 }
-                try text.appendSlice("```\n");
+                try text.writer.writeAll("```\n");
             }
 
             if (description.len != 0) {
-                if (group.items.len != 0) try text.appendSlice("\n");
-                try text.appendSlice(description);
+                if (group.items.len != 0) try text.writer.writeAll("\n");
+                try text.writer.writeAll(description);
             }
         }
 
-        if (text.items.len == 0) {
+        if (text.written().len == 0) {
             return state.success(request.id, null);
         }
 
         try state.success(request.id, .{
             .contents = lsp.MarkupContent{
                 .kind = .markdown,
-                .value = text.items,
+                .value = text.written(),
             },
         });
     }
@@ -827,12 +817,12 @@ pub const Dispatch = struct {
         },
     };
 
-    pub fn @"textDocument/formatting"(state: *State, request: *Request) !void {
+    pub fn @"textDocument/formatting"(state: *State, io: std.Io, request: *Request) !void {
         const params = try parseParams(FormattingParams, state, request);
         defer params.deinit();
         std.log.debug("format: {s} tabSize: {}", .{ params.value.textDocument.uri, params.value.options.tabSize });
 
-        const document = try state.workspace.getOrLoadDocument(params.value.textDocument);
+        const document = try state.workspace.getOrLoadDocument(io, params.value.textDocument);
         const parsed = try document.parseTree();
 
         var buffer: std.Io.Writer.Allocating = .init(state.allocator);
@@ -861,7 +851,7 @@ pub const Dispatch = struct {
         position: lsp.Position,
     };
 
-    pub fn @"textDocument/definition"(state: *State, request: *Request) !void {
+    pub fn @"textDocument/definition"(state: *State, io: std.Io, request: *Request) !void {
         const params = try parseParams(DefinitionParams, state, request);
         defer params.deinit();
         std.log.debug("goto definition: {f} {s}", .{
@@ -869,7 +859,7 @@ pub const Dispatch = struct {
             params.value.textDocument.uri,
         });
 
-        const document = try state.workspace.getOrLoadDocument(params.value.textDocument);
+        const document = try state.workspace.getOrLoadDocument(io, params.value.textDocument);
         const source_node = try document.identifierUnderCursor(params.value.position) orelse {
             std.log.debug("no node under cursor", .{});
             return state.success(request.id, null);
@@ -880,7 +870,7 @@ pub const Dispatch = struct {
 
         var arena = std.heap.ArenaAllocator.init(state.allocator);
         defer arena.deinit();
-        try analysis.findDefinition(arena.allocator(), document, source_node, &references);
+        try analysis.findDefinition(io, arena.allocator(), document, source_node, &references);
 
         if (references.items.len == 0) {
             std.log.debug("could not find definition", .{});
@@ -902,11 +892,11 @@ pub const Dispatch = struct {
 };
 
 test {
-    std.testing.refAllDeclsRecursive(@This());
-    std.testing.refAllDeclsRecursive(@import("Workspace.zig"));
-    std.testing.refAllDeclsRecursive(@import("Document.zig"));
-    std.testing.refAllDeclsRecursive(@import("parse.zig"));
-    std.testing.refAllDeclsRecursive(@import("format.zig"));
-    std.testing.refAllDeclsRecursive(@import("analysis.zig"));
-    std.testing.refAllDeclsRecursive(@import("syntax.zig"));
+    std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(@import("Workspace.zig"));
+    std.testing.refAllDecls(@import("Document.zig"));
+    std.testing.refAllDecls(@import("parse.zig"));
+    std.testing.refAllDecls(@import("format.zig"));
+    std.testing.refAllDecls(@import("analysis.zig"));
+    std.testing.refAllDecls(@import("syntax.zig"));
 }

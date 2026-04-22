@@ -13,7 +13,7 @@ spec: Spec,
 builtin_completions: []const lsp.CompletionItem,
 
 /// Documents in the workspace, accessed by their path.
-documents: std.StringHashMapUnmanaged(*Document) = .{},
+documents: std.StringHashMapUnmanaged(*Document) = .empty,
 
 pub fn init(allocator: std.mem.Allocator) !@This() {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -82,6 +82,7 @@ pub fn getOrCreateDocument(
 
 pub fn getOrLoadDocument(
     self: *Workspace,
+    io: std.Io,
     document: lsp.TextDocumentIdentifier,
 ) !*Document {
     const path = try util.pathFromUri(self.allocator, document.uri);
@@ -94,7 +95,7 @@ pub fn getOrLoadDocument(
         errdefer self.documents.removeByPtr(entry.key_ptr);
 
         const max_megabytes = 16;
-        const contents = try std.fs.cwd().readFileAlloc(self.allocator, path, max_megabytes << 20);
+        const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(max_megabytes << 20));
         errdefer self.allocator.free(contents);
 
         const new_document = try self.allocator.create(Document);
@@ -156,33 +157,33 @@ fn builtinCompletions(arena: std.mem.Allocator, spec: *const Spec) ![]lsp.Comple
     }
 
     for (spec.variables) |variable| {
-        var anonymous_signature = std.array_list.Managed(u8).init(arena);
-        try writeVariableSignature(variable, anonymous_signature.writer(), .{ .names = false });
+        var anonymous_signature: std.Io.Writer.Allocating = .init(arena);
+        try writeVariableSignature(variable, &anonymous_signature.writer, .{ .names = false });
 
-        var named_signature = std.array_list.Managed(u8).init(arena);
-        try writeVariableSignature(variable, named_signature.writer(), .{ .names = true });
+        var named_signature: std.Io.Writer.Allocating = .init(arena);
+        try writeVariableSignature(variable, &named_signature.writer, .{ .names = true });
 
         try completions.append(.{
             .label = variable.name,
-            .labelDetails = .{ .detail = anonymous_signature.items },
-            .detail = named_signature.items,
+            .labelDetails = .{ .detail = anonymous_signature.written() },
+            .detail = named_signature.written(),
             .kind = .variable,
             .documentation = try itemDocumentation(arena, variable),
         });
     }
 
     for (spec.functions) |function| {
-        var anonymous_signature = std.array_list.Managed(u8).init(arena);
-        try writeFunctionSignature(function, anonymous_signature.writer(), .{ .names = false });
+        var anonymous_signature: std.Io.Writer.Allocating = .init(arena);
+        try writeFunctionSignature(function, &anonymous_signature.writer, .{ .names = false });
 
-        var named_signature = std.array_list.Managed(u8).init(arena);
-        try writeFunctionSignature(function, named_signature.writer(), .{ .names = true });
+        var named_signature: std.Io.Writer.Allocating = .init(arena);
+        try writeFunctionSignature(function, &named_signature.writer, .{ .names = true });
 
         try completions.append(.{
             .label = function.name,
-            .labelDetails = .{ .detail = anonymous_signature.items },
+            .labelDetails = .{ .detail = anonymous_signature.written() },
             .kind = .function,
-            .detail = named_signature.items,
+            .detail = named_signature.written(),
             .documentation = try itemDocumentation(arena, function),
         });
     }
@@ -191,19 +192,19 @@ fn builtinCompletions(arena: std.mem.Allocator, spec: *const Spec) ![]lsp.Comple
 }
 
 fn itemDocumentation(arena: std.mem.Allocator, item: anytype) !lsp.MarkupContent {
-    var documentation = std.array_list.Managed(u8).init(arena);
+    var documentation: std.Io.Writer.Allocating = .init(arena);
 
     for (item.description orelse &.{}) |paragraph| {
-        try documentation.appendSlice(paragraph);
-        try documentation.appendSlice("\n\n");
+        try documentation.writer.writeAll(paragraph);
+        try documentation.writer.writeAll("\n\n");
     }
 
     if (item.extensions) |extensions| {
-        try documentation.appendSlice("```glsl\n");
+        try documentation.writer.writeAll("```glsl\n");
         for (extensions) |extension| {
-            try documentation.writer().print("#extension {s} : enable\n", .{extension});
+            try documentation.writer.print("#extension {s} : enable\n", .{extension});
         }
-        try documentation.appendSlice("```\n");
+        try documentation.writer.writeAll("```\n");
     }
 
     return .{ .kind = .markdown, .value = try documentation.toOwnedSlice() };

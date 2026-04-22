@@ -75,7 +75,7 @@ fn Writer(comptime ChildWriter: type) type {
         }
 
         fn writeLine(self: *Self, line: []const u8) !void {
-            const trimmed = std.mem.trimRight(u8, line, &std.ascii.whitespace);
+            const trimmed = std.mem.trimEnd(u8, line, &std.ascii.whitespace);
             if (trimmed.len == 0) return;
             try self.writeToChildRaw(trimmed);
         }
@@ -715,5 +715,5 @@ fn expectFormat(source: []const u8, expected: []const u8) !void {
 }
 
 test {
-    std.testing.refAllDeclsRecursive(@This());
+    std.testing.refAllDecls(@This());
 }

@@ -81,6 +81,7 @@ fn addExecutable(b: *std.Build, options: struct {
             .root_source_file = b.path("src/main.zig"),
             .target = options.target,
             .optimize = options.optimize,
+            .link_libc = true,
         }),
     });
     try attachModules(exe);
@@ -89,8 +90,6 @@ fn addExecutable(b: *std.Build, options: struct {
 
 fn attachModules(step: *std.Build.Step.Compile) !void {
     const b = step.step.owner;
-
-    step.linkLibC();
 
     step.root_module.addAnonymousImport("glsl_spec.json", .{ .root_source_file = b.path("spec/spec.json") });
 

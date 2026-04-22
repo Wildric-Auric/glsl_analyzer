@@ -1704,7 +1704,7 @@ fn skipIdentifier(start: u32, text: []const u8) u32 {
 }
 
 test {
-    std.testing.refAllDeclsRecursive(@This());
+    std.testing.refAllDecls(@This());
 }
 
 test "tokenize" {
@@ -1788,10 +1788,10 @@ test "parse and write" {
     var tree = try parse(std.testing.allocator, source, .{});
     defer tree.deinit(std.testing.allocator);
 
-    var buffer = std.array_list.Managed(u8).init(std.testing.allocator);
+    var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer buffer.deinit();
 
-    try buffer.writer().print("{f}", .{tree.format(source)});
+    try buffer.writer.print("{f}", .{tree.format(source)});
 
     try std.testing.expectEqualStrings(
         \\file
@@ -1811,7 +1811,7 @@ test "parse and write" {
         \\      identifier 'aPos'
         \\    ;
         \\
-    , buffer.items);
+    , buffer.written());
 }
 
 test "parse infix op" {
@@ -1822,10 +1822,10 @@ test "parse infix op" {
     var tree = try parse(std.testing.allocator, source, .{});
     defer tree.deinit(std.testing.allocator);
 
-    var buffer = std.array_list.Managed(u8).init(std.testing.allocator);
+    var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer buffer.deinit();
 
-    try buffer.writer().print("{f}", .{tree.format(source)});
+    try buffer.writer.print("{f}", .{tree.format(source)});
 
     try std.testing.expectEqualStrings(
         \\file
@@ -1840,7 +1840,7 @@ test "parse infix op" {
         \\        number '2'
         \\    ;
         \\
-    , buffer.items);
+    , buffer.written());
 }
 
 test "parse logical operator" {
@@ -1851,10 +1851,10 @@ test "parse logical operator" {
     var tree = try parse(std.testing.allocator, source, .{});
     defer tree.deinit(std.testing.allocator);
 
-    var buffer = std.array_list.Managed(u8).init(std.testing.allocator);
+    var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer buffer.deinit();
 
-    try buffer.writer().print("{f}", .{tree.format(source)});
+    try buffer.writer.print("{f}", .{tree.format(source)});
 
     try std.testing.expectEqualStrings(
         \\file
@@ -1869,7 +1869,7 @@ test "parse logical operator" {
         \\        keyword_true 'true'
         \\    ;
         \\
-    , buffer.items);
+    , buffer.written());
 }
 
 test "parse switch" {
@@ -1937,5 +1937,5 @@ fn expectParsesOkay(source: []const u8) !void {
 }
 
 test {
-    std.testing.refAllDeclsRecursive(@This());
+    std.testing.refAllDecls(@This());
 }

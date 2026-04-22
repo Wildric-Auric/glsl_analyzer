@@ -30,7 +30,7 @@ pub fn normalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     var buffer = try std.array_list.Managed(u8).initCapacity(allocator, path.len);
     errdefer buffer.deinit();
 
-    var components = try std.fs.path.componentIterator(path);
+    var components = std.fs.path.componentIterator(path);
 
     if (components.root()) |root| {
         try buffer.appendSlice(root);
