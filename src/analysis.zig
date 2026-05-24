@@ -35,7 +35,9 @@ pub const Type = struct {
     arrays: ?syntax.ListIterator(syntax.Array) = null,
     parameters: ?syntax.ParameterList = null,
 
-    pub fn format(self: @This(), tree: Tree, source: []const u8) std.fmt.Formatter(formatType) {
+    const FormatContainer = struct { tree: Tree, source: []const u8, type: Type };
+
+    pub fn format(self: @This(), tree: Tree, source: []const u8) std.fmt.Alt(FormatContainer, @This().formatType) {
         return .{ .data = .{ .tree = tree, .source = source, .type = self } };
     }
 
@@ -44,10 +46,8 @@ pub const Type = struct {
     }
 
     fn formatType(
-        data: struct { tree: Tree, source: []const u8, type: Type },
-        _: anytype,
-        _: anytype,
-        writer: anytype,
+        data: FormatContainer,
+        writer: *std.Io.Writer,
     ) !void {
         const prettify = @import("format.zig").format;
 
@@ -80,7 +80,7 @@ pub const Type = struct {
             while (iterator.next(data.tree)) |parameter| : (i += 1) {
                 const parameter_type = parameterType(parameter, data.tree);
                 if (i != 0) try writer.writeAll(", ");
-                try writer.print("{}", .{parameter_type.format(data.tree, data.source)});
+                try @This().formatType(.{ .tree = data.tree, .source = data.source, .type = parameter_type }, writer);
             }
             try writer.writeAll(")");
         }
@@ -137,17 +137,20 @@ pub fn parameterType(parameter: syntax.Parameter, tree: Tree) Type {
 }
 
 test "typeOf function" {
+    const io = std.testing.io;
     try expectTypeFormat(
+        io,
         "void /*0*/main() {}",
         &.{"void ()"},
     );
     try expectTypeFormat(
+        io,
         "int /*0*/add(int x, int y) {}",
         &.{"int (int, int)"},
     );
 }
 
-fn expectTypeFormat(source: []const u8, types: []const []const u8) !void {
+fn expectTypeFormat(io: std.Io, source: []const u8, types: []const []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -160,7 +163,7 @@ fn expectTypeFormat(source: []const u8, types: []const []const u8) !void {
     try document.replaceAll(source);
 
     var cursors = try findCursors(document);
-    defer cursors.deinit();
+    defer cursors.deinit(std.testing.allocator);
 
     const parsed = try document.parseTree();
     const tree = parsed.tree;
@@ -168,16 +171,16 @@ fn expectTypeFormat(source: []const u8, types: []const []const u8) !void {
     if (cursors.count() != types.len) return error.InvalidCursorCount;
 
     for (types, cursors.values()) |expected, cursor| {
-        var references = std.ArrayList(Reference).init(allocator);
+        var references = std.array_list.Managed(Reference).init(allocator);
         defer references.deinit();
 
-        try findDefinition(allocator, document, cursor.node, &references);
+        try findDefinition(io, allocator, document, cursor.node, &references);
         if (references.items.len != 1) return error.InvalidReference;
         const ref = references.items[0];
 
         const typ = try typeOf(ref) orelse return error.InvalidType;
 
-        const found = try std.fmt.allocPrint(allocator, "{}", .{typ.format(tree, document.source())});
+        const found = try std.fmt.allocPrint(allocator, "{f}", .{typ.format(tree, document.source())});
         defer allocator.free(found);
 
         try std.testing.expectEqualStrings(expected, found);
@@ -186,22 +189,23 @@ fn expectTypeFormat(source: []const u8, types: []const []const u8) !void {
 
 // Given a node in the given parse tree, attempts to find the node(s) it references.
 pub fn findDefinition(
+    io: std.Io,
     arena: std.mem.Allocator,
     document: *Document,
     node: u32,
-    references: *std.ArrayList(Reference),
+    references: *std.array_list.Managed(Reference),
 ) anyerror!void {
     const parse_tree = try document.parseTree();
     const tree = parse_tree.tree;
 
     const name = nodeName(tree, node, document.source()) orelse return;
 
-    var symbols = std.ArrayList(Reference).init(arena);
+    var symbols = std.array_list.Managed(Reference).init(arena);
     defer symbols.deinit();
 
-    try visibleFields(arena, document, node, &symbols);
+    try visibleFields(io, arena, document, node, &symbols);
     if (symbols.items.len == 0) {
-        try visibleSymbols(arena, document, node, &symbols);
+        try visibleSymbols(io, arena, document, node, &symbols);
     }
 
     for (symbols.items) |symbol| {
@@ -222,10 +226,11 @@ fn inFileRoot(tree: Tree, node: u32) bool {
 }
 
 pub fn visibleFields(
+    io: std.Io,
     arena: std.mem.Allocator,
     document: *Document,
     start_node: u32,
-    symbols: *std.ArrayList(Reference),
+    symbols: *std.array_list.Managed(Reference),
 ) !void {
     const lhs = lhs: {
         const parsed = try document.parseTree();
@@ -253,10 +258,10 @@ pub fn visibleFields(
         return;
     }
 
-    var name_definitions = std.ArrayList(Reference).init(arena);
-    try findDefinition(arena, document, lhs, &name_definitions);
+    var name_definitions = std.array_list.Managed(Reference).init(arena);
+    try findDefinition(io, arena, document, lhs, &name_definitions);
 
-    var references = std.ArrayList(Reference).init(document.workspace.allocator);
+    var references = std.array_list.Managed(Reference).init(document.workspace.allocator);
     defer references.deinit();
 
     for (name_definitions.items) |name_definition| {
@@ -287,7 +292,7 @@ pub fn visibleFields(
                     else => {
                         const identifier = specifier.underlyingName(tree) orelse continue;
                         if (identifier.node == start_node) continue;
-                        try findDefinition(arena, reference.document, identifier.node, &references);
+                        try findDefinition(io, arena, reference.document, identifier.node, &references);
                     },
                 }
                 continue;
@@ -315,8 +320,8 @@ pub const Scope = struct {
     const ScopeId = u32;
 
     allocator: std.mem.Allocator,
-    symbols: std.StringArrayHashMapUnmanaged(Symbol) = .{},
-    active_scopes: std.ArrayListUnmanaged(ScopeId) = .{},
+    symbols: std.StringArrayHashMapUnmanaged(Symbol) = .empty,
+    active_scopes: std.ArrayListUnmanaged(ScopeId) = .empty,
     next_scope: ScopeId = 0,
 
     const Symbol = struct {
@@ -369,7 +374,7 @@ pub const Scope = struct {
 
     pub fn getVisible(
         self: *const @This(),
-        symbols: *std.ArrayList(Reference),
+        symbols: *std.array_list.Managed(Reference),
         options: struct {
             /// An allocator used to detect duplicates.
             duplicate_allocator: std.mem.Allocator,
@@ -420,20 +425,20 @@ pub const Scope = struct {
         const func = syntax.ExtractorMixin(syntax.FunctionDeclaration).tryExtract(tree, decl_node) orelse return null;
         const parameters = func.get(.parameters, tree) orelse return null;
 
-        var signature = std.ArrayList(u8).init(allocator);
+        var signature: std.Io.Writer.Allocating = .init(allocator);
         errdefer signature.deinit();
 
-        try signature.appendSlice("(");
+        try signature.writer.writeAll("(");
 
         var i: usize = 0;
         var iterator = parameters.iterator();
         while (iterator.next(tree)) |parameter| : (i += 1) {
-            if (i != 0) try signature.appendSlice(", ");
+            if (i != 0) try signature.writer.writeAll(", ");
             const typ = parameterType(parameter, tree);
-            try signature.writer().print("{}", .{typ.format(tree, document.source())});
+            try signature.writer.print("{f}", .{typ.format(tree, document.source())});
         }
 
-        try signature.appendSlice(")");
+        try signature.writer.writeAll(")");
 
         return try signature.toOwnedSlice();
     }
@@ -441,10 +446,11 @@ pub const Scope = struct {
 
 /// Get a list of all symbols visible starting from the given syntax node.
 pub fn visibleSymbols(
+    io: std.Io,
     arena: std.mem.Allocator,
     start_document: *Document,
     start_node: u32,
-    symbols: *std.ArrayList(Reference),
+    symbols: *std.array_list.Managed(Reference),
 ) !void {
     var scope = Scope{ .allocator = arena };
     try scope.begin();
@@ -452,11 +458,11 @@ pub fn visibleSymbols(
 
     // collect global symbols:
     {
-        var documents = try std.ArrayList(*Document).initCapacity(arena, 8);
+        var documents = try std.array_list.Managed(*Document).initCapacity(arena, 8);
         defer documents.deinit();
 
         try documents.append(start_document);
-        try findIncludedDocumentsRecursive(arena, &documents);
+        try findIncludedDocumentsRecursive(io, arena, &documents);
 
         var documents_reverse = std.mem.reverseIterator(documents.items);
         while (documents_reverse.next()) |document| {
@@ -666,20 +672,22 @@ fn registerVariables(
 
 /// Appends the set of documents which are visible (recursively) from any of the documents in the list.
 fn findIncludedDocumentsRecursive(
+    io: std.Io,
     arena: std.mem.Allocator,
-    documents: *std.ArrayList(*Document),
+    documents: *std.array_list.Managed(*Document),
 ) !void {
     var i: usize = 0;
     while (i < documents.items.len) : (i += 1) {
-        try findIncludedDocuments(arena, documents.items[i], documents);
+        try findIncludedDocuments(io, arena, documents.items[i], documents);
     }
 }
 
 /// Appends the set of documents which are visible (directly) from the given document.
 fn findIncludedDocuments(
+    io: std.Io,
     arena: std.mem.Allocator,
     start: *Document,
-    documents: *std.ArrayList(*Document),
+    documents: *std.array_list.Managed(*Document),
 ) !void {
     const parsed = try start.parseTree();
 
@@ -701,9 +709,9 @@ fn findIncludedDocuments(
                 const uri = try util.uriFromPath(arena, absolute_path);
                 defer arena.free(uri);
 
-                const included_document = start.workspace.getOrLoadDocument(.{ .uri = uri }) catch |err| {
-                    std.log.err("could not open '{'}': {s}", .{
-                        std.zig.fmtEscapes(uri),
+                const included_document = start.workspace.getOrLoadDocument(io, .{ .uri = uri }) catch |err| {
+                    std.log.err("could not open '{f}': {s}", .{
+                        std.zig.fmtString(uri),
                         @errorName(err),
                     });
                     continue;
@@ -742,7 +750,8 @@ fn nodeName(tree: Tree, node: u32, source: []const u8) ?[]const u8 {
 }
 
 test "find definition local variable" {
-    try expectDefinition(
+    const io = std.testing.io;
+    try expectDefinition(io,
         \\void main() {
         \\    int /*2*/x = 1;
         \\    /*1*/x += 2;
@@ -750,7 +759,7 @@ test "find definition local variable" {
     , &.{
         .{ .source = "/*1*/", .target = "/*2*/", .should_exist = true },
     });
-    try expectDefinition(
+    try expectDefinition(io,
         \\void main() {
         \\    for (int /*2*/i = 0; i < 10; i++) {
         \\         /*1*/i += 1;
@@ -759,7 +768,7 @@ test "find definition local variable" {
     , &.{
         .{ .source = "/*1*/", .target = "/*2*/", .should_exist = true },
     });
-    try expectDefinition(
+    try expectDefinition(io,
         \\void main() {
         \\    int /*3*/foo;
         \\    {
@@ -774,14 +783,15 @@ test "find definition local variable" {
 }
 
 test "find definition parameter" {
-    try expectDefinition(
+    const io = std.testing.io;
+    try expectDefinition(io,
         \\int bar(int /*2*/x) {
         \\    return /*1*/x;
         \\}
     , &.{
         .{ .source = "/*1*/", .target = "/*2*/", .should_exist = true },
     });
-    try expectDefinition(
+    try expectDefinition(io,
         \\int foo(int /*2*/x) { return x; }
         \\int bar() {
         \\    return /*1*/x;
@@ -792,7 +802,8 @@ test "find definition parameter" {
 }
 
 test "find definition function" {
-    try expectDefinition(
+    const io = std.testing.io;
+    try expectDefinition(io,
         \\void /*3*/foo(int x) {}
         \\void /*2*/foo() {}
         \\void main() {
@@ -802,7 +813,7 @@ test "find definition function" {
         .{ .source = "/*1*/", .target = "/*2*/", .should_exist = true },
         .{ .source = "/*1*/", .target = "/*3*/", .should_exist = true },
     });
-    try expectDefinition(
+    try expectDefinition(io,
         \\void /*3*/foo() {}
         \\void main() {
         \\    int /*2*/foo = 123;
@@ -815,7 +826,8 @@ test "find definition function" {
 }
 
 test "find definition global" {
-    try expectDefinition(
+    const io = std.testing.io;
+    try expectDefinition(io,
         \\layout(location = 1) uniform vec4 /*2*/color;
         \\void main() {
         \\    /*1*/color;
@@ -823,7 +835,7 @@ test "find definition global" {
     , &.{
         .{ .source = "/*1*/", .target = "/*2*/", .should_exist = true },
     });
-    try expectDefinition(
+    try expectDefinition(io,
         \\layout(location = 1) uniform MyBlock { vec4 /*4*/color; } /*2*/my_block;
         \\void main() {
         \\    /*3*/color;
@@ -836,7 +848,8 @@ test "find definition global" {
 }
 
 test "find definition field" {
-    try expectDefinition(
+    const io = std.testing.io;
+    try expectDefinition(io,
         \\struct Foo { int /*1*/bar, /*2*/baz; };
         \\void main() {
         \\    Foo foo;
@@ -852,7 +865,8 @@ test "find definition field" {
 }
 
 test "find definition field recursive" {
-    try expectDefinition(
+    const io = std.testing.io;
+    try expectDefinition(io,
         \\struct Foo { int /*1*/foo; };
         \\struct Bar { Foo /*2*/bar; };
         \\void main() {
@@ -868,7 +882,8 @@ test "find definition field recursive" {
 }
 
 test "find definition self" {
-    try expectDefinition(
+    const io = std.testing.io;
+    try expectDefinition(io,
         \\void main(int /*1*/whatever) {
         \\    float /*2*/foo;
         \\}
@@ -879,7 +894,8 @@ test "find definition self" {
 }
 
 test "find definition self-multi" {
-    try expectDefinition(
+    const io = std.testing.io;
+    try expectDefinition(io,
         \\void main() {
         \\    float /*1*/foo = 123, bar = /*2*/foo;
         \\}
@@ -889,7 +905,8 @@ test "find definition self-multi" {
 }
 
 test "find definition local shadowing" {
-    try expectDefinition(
+    const io = std.testing.io;
+    try expectDefinition(io,
         \\void main() {
         \\    float /*1*/foo;
         \\    int /*2*/foo = /*3*/foo;
@@ -901,7 +918,8 @@ test "find definition local shadowing" {
 }
 
 test "find definition duplicate overload" {
-    try expectDefinition(
+    const io = std.testing.io;
+    try expectDefinition(io,
         \\float /*1*/add(float a, float b);
         \\int /*2*/add(int a, int b);
         \\void main() {
@@ -916,6 +934,7 @@ test "find definition duplicate overload" {
 }
 
 fn expectDefinition(
+    io: std.Io,
     source: []const u8,
     cases: []const struct {
         source: []const u8,
@@ -933,7 +952,7 @@ fn expectDefinition(
     try document.replaceAll(source);
 
     var cursors = try findCursors(document);
-    defer cursors.deinit();
+    defer cursors.deinit(std.testing.allocator);
 
     var print_source = false;
 
@@ -941,9 +960,9 @@ fn expectDefinition(
         const usage = cursors.get(case.source) orelse std.debug.panic("invalid cursor: {s}", .{case.source});
         const definition = cursors.get(case.target) orelse std.debug.panic("invalid cursor: {s}", .{case.source});
 
-        var references = std.ArrayList(Reference).init(workspace.allocator);
+        var references = std.array_list.Managed(Reference).init(workspace.allocator);
         defer references.deinit();
-        try findDefinition(arena.allocator(), document, usage.node, &references);
+        try findDefinition(io, arena.allocator(), document, usage.node, &references);
 
         var found_definition = false;
         for (references.items) |reference| {
@@ -973,26 +992,27 @@ const Cursor = struct {
     node: u32,
 };
 
-fn findCursors(document: *Document) !std.StringArrayHashMap(Cursor) {
+fn findCursors(document: *Document) !std.array_hash_map.String(Cursor) {
     const parsed = try document.parseTree();
     const tree = &parsed.tree;
 
-    var cursors = std.StringArrayHashMap(Cursor).init(std.testing.allocator);
-    errdefer cursors.deinit();
+    var cursors: std.array_hash_map.String(Cursor) = .empty;
+    errdefer cursors.deinit(std.testing.allocator);
 
     for (parsed.ignored) |cursor| {
         for (tree.nodes.items(.span), tree.nodes.items(.tag), 0..) |token, tag, index| {
             if (tag.isSyntax()) continue;
             if (cursor.end == token.start) {
                 try cursors.putNoClobber(
+                    std.testing.allocator,
                     document.source()[cursor.start..cursor.end],
                     .{ .node = @intCast(index) },
                 );
                 break;
             }
         } else {
-            std.debug.panic("cursor not found: \"{}\"", .{
-                std.zig.fmtEscapes(document.source()[cursor.start..cursor.end]),
+            std.debug.panic("cursor not found: \"{f}\"", .{
+                std.zig.fmtString(document.source()[cursor.start..cursor.end]),
             });
         }
     }
@@ -1001,5 +1021,5 @@ fn findCursors(document: *Document) !std.StringArrayHashMap(Cursor) {
 }
 
 test {
-    std.testing.refAllDeclsRecursive(@This());
+    std.testing.refAllDecls(@This());
 }
