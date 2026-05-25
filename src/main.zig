@@ -425,30 +425,36 @@ const State = struct {
     }
 
     pub fn sendNotification(self: *State, method: []const u8, params: anytype) !void {
-        const params_bytes = try std.json.stringifyAlloc(self.allocator, params, .{});
+        const fmt = std.json.fmt(params, .{.whitespace = .indent_2});
+        var wrt_bytes = std.Io.Writer.Allocating.init(self.allocator);
+        defer wrt_bytes.deinit();
+        try fmt.format(&wrt_bytes.writer);
+        const params_bytes = try wrt_bytes.toOwnedSlice();
         defer self.allocator.free(params_bytes);
-
         const notification = Notification{
             .method = method,
             .params = .{ .raw = params_bytes },
         };
-
-        const format_options = std.json.StringifyOptions{
-            .emit_null_optional_fields = false,
+        var tmp_writer:std.Io.Writer.Allocating = std.Io.Writer.Allocating.init(self.allocator);
+        defer tmp_writer.deinit();
+        var json_wrt: std.json.Stringify =  .{
+            .writer = &tmp_writer.writer,
+            .options = .{
+                .emit_null_optional_fields = false,
+                .whitespace = .indent_2
+            }
         };
-
-        var counting = std.io.countingWriter(std.io.null_writer);
-        try std.json.stringify(notification, format_options, counting.writer());
-        const content_length = counting.bytes_written;
-
-        const writer = self.channel.writer();
-        try writer.print("Content-Length: {}\r\n\r\n", .{content_length});
-        try std.json.stringify(notification, format_options, writer);
+        const writer:*std.Io.Writer = self.channel;
+        try notification.jsonStringify(&json_wrt);
+        const bytes = try tmp_writer.toOwnedSlice(); 
+        defer self.allocator.free(bytes);
+        try writer.print("Content-Length: {}\r\n\r\n", .{bytes.len});
+        try writer.writeAll(bytes);
         try self.channel.flush();
     }
 
     pub fn publishDiagnostics(self: *State, document: *Workspace.Document) !void {
-        var parse_diagnostics = std.ArrayList(parse.Diagnostic).init(self.allocator);
+        var parse_diagnostics = std.array_list.Managed(parse.Diagnostic).init(self.allocator);
         defer parse_diagnostics.deinit();
 
         const parsed: *const Workspace.Document.CompleteParseTree = try document.parseTree();
